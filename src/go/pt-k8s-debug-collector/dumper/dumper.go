@@ -442,7 +442,33 @@ func (d *Dumper) getResource(name, namespace string, ignoreNotFound bool, tw *ta
 	if ignoreNotFound && len(output) == 0 {
 		return nil
 	}
+
+	if strings.Contains(name, "secret") && strings.Contains(name, "pgbouncer") {
+		output, err = removePgbouncerSecretData(output)
+		if err != nil {
+			d.logError(err.Error(), args...)
+			log.Printf("Error: remove secret data from resource %s in namespace %s: %v", name, namespace, err)
+			return addToArchive(location, d.mode, []byte(err.Error()), tw)
+		}
+
+	}
+
 	return addToArchive(location, d.mode, output, tw)
+}
+
+func removePgbouncerSecretData(input []byte) ([]byte, error) {
+	str := string(input)
+	startIndex := strings.Index(str, "\ndata:\n")
+	if startIndex == -1 {
+		return nil, errors.New("failed to find start index of pgbouncer secret data")
+	}
+	endIndex := strings.Index(str, "\nkind")
+	if endIndex == -1 {
+		return nil, errors.New("failed to find end index of pgbouncer secret data")
+	}
+	str = str[:startIndex] +
+		"\ndata:\n warning: pt-k8s-debug-collector is not collecting secret details of pgbouncer" + str[endIndex:]
+	return []byte(str), nil
 }
 
 func (d *Dumper) logError(err string, args ...string) {
