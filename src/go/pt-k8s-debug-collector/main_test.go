@@ -2,14 +2,16 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
-	"golang.org/x/exp/slices"
+	"github.com/percona/percona-toolkit/src/go/tests/utils"
 )
 
 /*
@@ -45,9 +47,46 @@ Tests TODO:
 Tests collection of the individual files by pt-k8s-debug-collector.
 Requires running K8SPXC instance and kubectl, configured to access that instance by default.
 */
+
+const (
+	pxc_bundle   = "../tests/kubeconfigs/pxc_bundle.yaml"
+	pxc_cr       = "../tests/kubeconfigs/pxc_cr.yaml"
+	ps_bundle    = "../tests/kubeconfigs/ps_bundle.yaml"
+	ps_cr        = "../tests/kubeconfigs/ps_cr.yaml"
+	psmdb_bundle = "../tests/kubeconfigs/psmdb_bundle.yaml"
+	psmdb_cr     = "../tests/kubeconfigs/psmdb_cr.yaml"
+	pgv2_bundle  = "../tests/kubeconfigs/pg_v2_bundle.yaml"
+	pgv2_cr      = "../tests/kubeconfigs/pg_v2_cr.yaml"
+	pgv1_bundle  = "../tests/kubeconfigs/pg_v1_bundle.yaml"
+	pgv1_cr      = "../tests/kubeconfigs/pg_v1_cr.yaml"
+)
+
+func TestMain(m *testing.M) {
+	setupConfigs := make(map[string]string) // key = path to operator yaml | value = path to cluster yaml
+	setupConfigs[pxc_bundle] = pxc_cr
+	setupConfigs[ps_bundle] = ps_cr
+	setupConfigs[psmdb_bundle] = psmdb_cr
+	setupConfigs[pgv2_bundle] = pgv2_cr
+	//setupConfigs[pgv1_bundle] = pgv1_cr
+
+	err := utils.SetupK8sConcurrent(setupConfigs)
+	if err != nil {
+		fmt.Printf("error when setuping k8s: %v", err)
+		os.Exit(1)
+	}
+
+	exitCode := m.Run()
+	if exitCode == 0 {
+		fmt.Println("Tests finished succesfully, destroying minikube")
+		utils.StopMinikube()
+	}
+	os.Exit(exitCode)
+}
+
 func TestIndividualFiles(t *testing.T) {
-	if os.Getenv("KUBECONFIG_PXC") == "" {
-		t.Skip("TestIndividualFiles requires K8SPXC")
+	config, err := utils.GetKubeConfigString()
+	if err != nil {
+		t.Fatalf("error getting config for kube: %v", err)
 	}
 	tests := []struct {
 		name         string
@@ -91,7 +130,7 @@ func TestIndividualFiles(t *testing.T) {
 	}
 
 	for _, resource := range []string{"pxc", "auto"} {
-		cmd := exec.Command("../../../bin/pt-k8s-debug-collector", "--kubeconfig", os.Getenv("KUBECONFIG_PXC"), "--forwardport", os.Getenv("FORWARDPORT"), "--resource", resource)
+		cmd := exec.Command("../../../bin/pt-k8s-debug-collector", "--kubeconfig", config, "--forwardport", os.Getenv("FORWARDPORT"), "--resource", resource)
 		if err := cmd.Run(); err != nil {
 			t.Errorf("error executing pt-k8s-debug-collector: %s", err.Error())
 		}
@@ -118,6 +157,10 @@ func TestIndividualFiles(t *testing.T) {
 Tests for supported values of the --resource option
 */
 func TestResourceOption(t *testing.T) {
+	config, err := utils.GetKubeConfigString()
+	if err != nil {
+		t.Fatalf("error getting config for kube: %v", err)
+	}
 	testcmd := []string{"sh", "-c", "tar -tf cluster-dump.tar.gz --wildcards '*/summary.txt' 2>/dev/null | wc -l"}
 	tests := []struct {
 		name       string
@@ -194,16 +237,18 @@ func TestResourceOption(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		cmd := exec.Command("../../../bin/pt-k8s-debug-collector", "--kubeconfig", test.kubeconfig, "--forwardport", os.Getenv("FORWARDPORT"), "--resource", test.resource)
+		cmd := exec.Command("../../../bin/pt-k8s-debug-collector", "--kubeconfig", config, "--forwardport", os.Getenv("FORWARDPORT"), "--resource", test.resource)
 		if err := cmd.Run(); err != nil {
 			t.Errorf("error executing pt-k8s-debug-collector: %s", err.Error())
 		}
+
 		defer func() {
 			cmd = exec.Command("rm", "-f", "cluster-dump.tar.gz")
 			if err := cmd.Run(); err != nil {
 				t.Errorf("error cleaning up test data: %s", err.Error())
 			}
 		}()
+
 		out, err := exec.Command(testcmd[0], testcmd[1:]...).Output()
 		if err != nil {
 			t.Errorf("test %s, error running command %s:\n%s\n\nCommand output:\n%s", test.name, testcmd, err.Error(), out)
@@ -218,6 +263,10 @@ func TestResourceOption(t *testing.T) {
 PT-2299 - collect openssl x509 certificate information for each secret
 */
 func TestSSLResourceOption(t *testing.T) {
+	config, err := utils.GetKubeConfigString()
+	if err != nil {
+		t.Fatalf("error getting config for kube: %v", err)
+	}
 	tests := []struct {
 		name       string
 		resource   string
@@ -343,7 +392,7 @@ func TestSSLResourceOption(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		cmd := exec.Command("../../../bin/pt-k8s-debug-collector", "--kubeconfig", test.kubeconfig, "--forwardport", os.Getenv("FORWARDPORT"), "--resource", test.resource)
+		cmd := exec.Command("../../../bin/pt-k8s-debug-collector", "--kubeconfig", config, "--forwardport", os.Getenv("FORWARDPORT"), "--resource", test.resource)
 		if err := cmd.Run(); err != nil {
 			t.Errorf("error executing pt-k8s-debug-collector: %s", err.Error())
 		}
@@ -369,6 +418,10 @@ func TestSSLResourceOption(t *testing.T) {
 Tests for option --skip-pod-summary
 */
 func TestPT_2453(t *testing.T) {
+	config, err := utils.GetKubeConfigString()
+	if err != nil {
+		t.Fatalf("error getting config for kube: %v", err)
+	}
 	testcmd := []string{"sh", "-c", "tar -tf cluster-dump.tar.gz --wildcards '*/summary.txt' 2>/dev/null | wc -l"}
 	tests := []struct {
 		name       string
@@ -445,7 +498,7 @@ func TestPT_2453(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		cmd := exec.Command("../../../bin/pt-k8s-debug-collector", "--kubeconfig", test.kubeconfig, "--forwardport", os.Getenv("FORWARDPORT"), "--resource", test.resource, "--skip-pod-summary")
+		cmd := exec.Command("../../../bin/pt-k8s-debug-collector", "--kubeconfig", config, "--forwardport", os.Getenv("FORWARDPORT"), "--resource", test.resource, "--skip-pod-summary")
 		if err := cmd.Run(); err != nil {
 			t.Errorf("error executing pt-k8s-debug-collector: %s\nCommand: %s", err.Error(), cmd.String())
 		}
@@ -484,6 +537,10 @@ func TestVersionOption(t *testing.T) {
 If we handle error properly
 */
 func TestPT_2169(t *testing.T) {
+	config, err := utils.GetKubeConfigString()
+	if err != nil {
+		t.Fatalf("error getting config for kube: %v", err)
+	}
 	busyport, _ := os.Getwd() // we are using wrong socket for ssh tunnel here to ensure we get error
 
 	testcmd := []string{"sh", "-c", "tar -xf cluster-dump.tar.gz --wildcards '*/summary.txt' --to-command 'grep stderr:' 2>/dev/null | wc -l"}
@@ -511,7 +568,7 @@ func TestPT_2169(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		cmd := exec.Command("../../../bin/pt-k8s-debug-collector", "--kubeconfig", test.kubeconfig, "--forwardport", test.port, "--resource", test.resource)
+		cmd := exec.Command("../../../bin/pt-k8s-debug-collector", "--kubeconfig", config, "--forwardport", test.port, "--resource", test.resource)
 		if err := cmd.Run(); err != nil {
 			t.Errorf("error executing pt-k8s-debug-collector: %s", err.Error())
 		}

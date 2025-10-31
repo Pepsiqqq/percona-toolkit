@@ -52,10 +52,14 @@ func main() {
 		resource += "/" + clusterName
 	}
 
-	d := dumper.New("", namespace, resource, kubeconfig, forwardport, skipPodSummary)
+	d, err := dumper.New("", namespace, resource, kubeconfig, forwardport, skipPodSummary)
+	if err != nil {
+		log.Println("Error:", err)
+		os.Exit(1)
+	}
 	log.Println("Start collecting cluster data")
 
-	err := d.DumpCluster()
+	err = d.DumpCluster()
 	if err != nil {
 		log.Println("Error:", err)
 		os.Exit(1)

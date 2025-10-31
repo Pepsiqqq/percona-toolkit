@@ -6,17 +6,26 @@ import (
 	"compress/gzip"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"text/template"
 	"time"
 
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/discovery/cached/memory"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/restmapper"
+	"k8s.io/client-go/tools/clientcmd"
+
 )
 
 // sslSecret struct for dumping certificates
@@ -41,20 +50,43 @@ type Dumper struct {
 	forwardport    string
 	sslSecrets     []sslSecret
 	skipPodSummary bool
+
+	dynamicClient   *dynamic.DynamicClient
+	restConfig      *rest.Config
+	discoveryClient *discovery.DiscoveryClient
+	restMapper      *restmapper.DeferredDiscoveryRESTMapper
 }
 
 var resourcesRe = regexp.MustCompile(`(\w+\.(\w+).percona\.com)`)
 
 // New return new Dumper object
-func New(location, namespace, resource string, kubeconfig string, forwardport string, skipPodSummary bool) Dumper {
-	d := Dumper{
-		cmd:            "kubectl",
-		kubeconfig:     kubeconfig,
-		location:       "cluster-dump",
-		mode:           int64(0o777),
-		namespace:      namespace,
-		forwardport:    forwardport,
-		skipPodSummary: skipPodSummary,
+func New(location, namespace, resource string, kubeconfig string, forwardport string, skipPodSummary bool) (*Dumper, error) {
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build config from flags: %w", err)
+	}
+	dynClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create dynamic client: %w", err)
+	}
+	dc, err := discovery.NewDiscoveryClientForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create dynamic client: %w", err)
+	}
+	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(dc))
+
+	d := &Dumper{
+		cmd:             "kubectl",
+		kubeconfig:      kubeconfig,
+		location:        "cluster-dump",
+		mode:            int64(0o777),
+		namespace:       namespace,
+		forwardport:     forwardport,
+		skipPodSummary:  skipPodSummary,
+		dynamicClient:   dynClient,
+		restConfig:      config,
+		discoveryClient: dc,
+		restMapper:      mapper,
 	}
 	resources := []string{
 		"pods",
@@ -78,11 +110,40 @@ func New(location, namespace, resource string, kubeconfig string, forwardport st
 
 	switch resourceType(resource) {
 	case "auto":
-		result, err := d.runCmd("api-resources", "-o", "name")
+		apiGroupList, err := d.discoveryClient.ServerGroups()
 		if err != nil {
-			log.Panicf("Cannot get API resources and option --resource=auto specified:\n%s", err)
+			log.Fatalf("Error getting server groups: %v", err)
 		}
-		matches := resourcesRe.FindAllStringSubmatch(string(result), -1)
+		var resourceNames string
+		var beforeSorting []string
+		uniqueResourceNames := make(map[string]bool)
+		for _, group := range apiGroupList.Groups {
+			for _, version := range group.Versions {
+				resourceList, err := d.discoveryClient.ServerResourcesForGroupVersion(version.GroupVersion)
+				if err != nil {
+					log.Printf("Warning: Could not get resources for GroupVersion %s: %v", version.GroupVersion, err)
+					continue
+				}
+				for _, resource := range resourceList.APIResources {
+					if resource.Name != "" && !strings.Contains(resource.Name, "/") {
+						if group.Name != "" {
+							uniqueResourceNames[resource.Name+"."+group.Name] = true
+						} else {
+							uniqueResourceNames[resource.Name] = true
+						}
+					}
+				}
+			}
+		}
+		for name := range uniqueResourceNames {
+			beforeSorting = append(beforeSorting, name)
+		}
+		slices.Sort(beforeSorting)
+		for _, name := range beforeSorting {
+			resourceNames = resourceNames + name + "\n"
+		}
+
+		matches := resourcesRe.FindAllStringSubmatch(resourceNames, -1)
 		if len(matches) == 0 {
 			resource = "none"
 			break
@@ -228,7 +289,7 @@ func New(location, namespace, resource string, kubeconfig string, forwardport st
 	d.sslSecrets = sslSecrets
 	d.crType = resource
 	d.filePaths = filePaths
-	return d
+	return d, nil
 }
 
 type k8sPods struct {
