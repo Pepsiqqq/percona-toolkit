@@ -13465,7 +13465,7 @@ spec:
               apiVersion: v1
               fieldPath: metadata.namespace
         - name: DISABLE_TELEMETRY
-          value: "false"
+          value: "true"
         image: percona/percona-server-mysql-operator:0.12.0
         imagePullPolicy: Always
         livenessProbe:

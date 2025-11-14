@@ -52,7 +52,7 @@ func main() {
 		resource += "/" + clusterName
 	}
 
-	d, err := dumper.New("", namespace, resource, kubeconfig, forwardport, skipPodSummary)
+	d, err := dumper.New("", namespace, kubeconfig, forwardport, resource, skipPodSummary)
 	if err != nil {
 		log.Println("Error:", err)
 		os.Exit(1)

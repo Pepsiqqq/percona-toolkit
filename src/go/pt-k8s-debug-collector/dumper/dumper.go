@@ -4,44 +4,49 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
-	"encoding/base64"
-	"encoding/json"
+	"context"
+	"errors"
 	"fmt"
+	"html/template"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
-	"text/template"
 	"time"
 
-	"github.com/pkg/errors"
+	"go.yaml.in/yaml/v2"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/client-go/discovery"
-	"k8s.io/client-go/discovery/cached/memory"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
-
 )
 
-// sslSecret struct for dumping certificates
+// sslSecret struct is used for dumping certificates.
 type sslSecret struct {
-	secret    string
-	resource  string
-	dataNames []string
+	secretTemplate string
+	secretGVR      schema.GroupVersionResource
+	secretDataName []string
+}
+
+// individualFile struct is used to dump the necessary files from the containers
+type individualFile struct {
+	containerName string
+	filepaths     []string
 }
 
 // Dumper struct is for dumping cluster
 type Dumper struct {
-	cmd            string
 	kubeconfig     string
-	resources      []string
-	filePaths      []string
-	fileContainer  string
+	resourcesMap   []schema.GroupVersionResource
 	namespace      string
 	location       string
 	errors         string
@@ -51,16 +56,17 @@ type Dumper struct {
 	sslSecrets     []sslSecret
 	skipPodSummary bool
 
+	individualFiles []individualFile
+	clientSet       *kubernetes.Clientset
 	dynamicClient   *dynamic.DynamicClient
 	restConfig      *rest.Config
-	discoveryClient *discovery.DiscoveryClient
-	restMapper      *restmapper.DeferredDiscoveryRESTMapper
+	tw              *tar.Writer
 }
 
 var resourcesRe = regexp.MustCompile(`(\w+\.(\w+).percona\.com)`)
 
 // New return new Dumper object
-func New(location, namespace, resource string, kubeconfig string, forwardport string, skipPodSummary bool) (*Dumper, error) {
+func New(location, namespace, kubeconfig, forwardport, resource string, skipPodSummary bool) (*Dumper, error) {
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build config from flags: %w", err)
@@ -69,163 +75,208 @@ func New(location, namespace, resource string, kubeconfig string, forwardport st
 	if err != nil {
 		return nil, fmt.Errorf("failed to create dynamic client: %w", err)
 	}
-	dc, err := discovery.NewDiscoveryClientForConfig(config)
+	clientSet, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create dynamic client: %w", err)
+		return nil, fmt.Errorf("failed to create client set: %w", err)
 	}
-	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(dc))
 
 	d := &Dumper{
-		cmd:             "kubectl",
-		kubeconfig:      kubeconfig,
-		location:        "cluster-dump",
-		mode:            int64(0o777),
-		namespace:       namespace,
-		forwardport:     forwardport,
-		skipPodSummary:  skipPodSummary,
-		dynamicClient:   dynClient,
-		restConfig:      config,
-		discoveryClient: dc,
-		restMapper:      mapper,
-	}
-	resources := []string{
-		"pods",
-		"replicasets",
-		"deployments",
-		"statefulsets",
-		"replicationcontrollers",
-		"events",
-		"configmaps",
-		"cronjobs",
-		"jobs",
-		"poddisruptionbudgets",
-		"clusterrolebindings",
-		"clusterroles",
-		"rolebindings",
-		"roles",
-		"storageclasses",
-		"persistentvolumeclaims",
-		"persistentvolumes",
+		kubeconfig:     kubeconfig,
+		location:       "cluster-dump",
+		mode:           int64(0o777),
+		namespace:      namespace,
+		forwardport:    forwardport,
+		skipPodSummary: skipPodSummary,
+		clientSet:      clientSet,
+		dynamicClient:  dynClient,
+		restConfig:     config,
+		crType:         resource,
 	}
 
-	switch resourceType(resource) {
-	case "auto":
-		apiGroupList, err := d.discoveryClient.ServerGroups()
+	d.resourcesMap = []schema.GroupVersionResource{
+		{
+			Group:    "",
+			Version:  "v1",
+			Resource: "pods",
+		},
+		{
+			Group:    "",
+			Version:  "v1",
+			Resource: "replicationcontrollers",
+		},
+		{
+			Group:    "",
+			Version:  "v1",
+			Resource: "events",
+		},
+		{
+			Group:    "",
+			Version:  "v1",
+			Resource: "configmaps",
+		},
+		{
+			Group:    "",
+			Version:  "v1",
+			Resource: "persistentvolumeclaims",
+		},
+		{
+			Group:    "",
+			Version:  "v1",
+			Resource: "persistentvolumes",
+		},
+		{
+			Group:    "apps",
+			Version:  "v1",
+			Resource: "replicasets",
+		},
+		{
+			Group:    "apps",
+			Version:  "v1",
+			Resource: "deployments",
+		},
+		{
+			Group:    "apps",
+			Version:  "v1",
+			Resource: "statefulsets",
+		},
+		{
+			Group:    "batch",
+			Version:  "v1",
+			Resource: "cronjobs",
+		},
+		{
+			Group:    "batch",
+			Version:  "v1",
+			Resource: "jobs",
+		},
+		{
+			Group:    "policy",
+			Version:  "v1",
+			Resource: "poddisruptionbudgets",
+		},
+		{
+			Group:    "rbac.authorization.k8s.io",
+			Version:  "v1",
+			Resource: "clusterrolebindings",
+		},
+		{
+			Group:    "rbac.authorization.k8s.io",
+			Version:  "v1",
+			Resource: "clusterroles",
+		},
+		{
+			Group:    "rbac.authorization.k8s.io",
+			Version:  "v1",
+			Resource: "rolebindings",
+		},
+		{
+			Group:    "rbac.authorization.k8s.io",
+			Version:  "v1",
+			Resource: "roles",
+		},
+		{
+			Group:    "storage.k8s.io",
+			Version:  "v1",
+			Resource: "storageclasses",
+		},
+	}
+	d.sslSecrets = make([]sslSecret, 0)
+
+	// if the resource is automatic we first need to determine which one we need to use
+	if resourceType(d.crType) == "auto" {
+		d.crType, err = d.autoCustomResource()
 		if err != nil {
-			log.Fatalf("Error getting server groups: %v", err)
+			return nil, fmt.Errorf("failed to determine custom resource automatically: %w", err)
 		}
-		var resourceNames string
-		var beforeSorting []string
-		uniqueResourceNames := make(map[string]bool)
-		for _, group := range apiGroupList.Groups {
-			for _, version := range group.Versions {
-				resourceList, err := d.discoveryClient.ServerResourcesForGroupVersion(version.GroupVersion)
-				if err != nil {
-					log.Printf("Warning: Could not get resources for GroupVersion %s: %v", version.GroupVersion, err)
-					continue
-				}
-				for _, resource := range resourceList.APIResources {
-					if resource.Name != "" && !strings.Contains(resource.Name, "/") {
-						if group.Name != "" {
-							uniqueResourceNames[resource.Name+"."+group.Name] = true
-						} else {
-							uniqueResourceNames[resource.Name] = true
-						}
-					}
-				}
-			}
-		}
-		for name := range uniqueResourceNames {
-			beforeSorting = append(beforeSorting, name)
-		}
-		slices.Sort(beforeSorting)
-		for _, name := range beforeSorting {
-			resourceNames = resourceNames + name + "\n"
-		}
-
-		matches := resourcesRe.FindAllStringSubmatch(resourceNames, -1)
-		if len(matches) == 0 {
-			resource = "none"
-			break
-		}
-		for _, match := range matches {
-			resources = append(resources, match[1])
-			resource = match[2]
-		}
-	case "pg":
-		resources = append(resources,
-			"perconapgclusters.pg.percona.com",
-			"pgclusters.pg.percona.com",
-			"pgpolicies.pg.percona.com",
-			"pgreplicas.pg.percona.com",
-			"pgtasks.pg.percona.com",
-		)
-	case "pgv2":
-		resources = append(resources,
-			"perconapgbackups.pgv2.percona.com",
-			"perconapgclusters.pgv2.percona.com",
-			"perconapgrestores.pgv2.percona.com",
-		)
-	case "pxc":
-		resources = append(resources,
-			"perconaxtradbclusterbackups.pxc.percona.com",
-			"perconaxtradbclusterrestores.pxc.percona.com",
-			"perconaxtradbclusters.pxc.percona.com",
-		)
-	case "ps":
-		resources = append(resources,
-			"perconaservermysqlbackups.ps.percona.com",
-			"perconaservermysqlrestores.ps.percona.com",
-			"perconaservermysqls.ps.percona.com",
-		)
-	case "psmdb":
-		resources = append(resources,
-			"perconaservermongodbbackups.psmdb.percona.com",
-			"perconaservermongodbrestores.psmdb.percona.com",
-			"perconaservermongodbs.psmdb.percona.com",
-		)
 	}
-	sslSecrets := make([]sslSecret, 0)
-	filePaths := make([]string, 0)
-	switch resourceType(resource) {
+
+	switch resourceType(d.crType) {
 	case "pg":
-		sslSecrets = append(sslSecrets,
-			sslSecret{
-				secret:    "{{ .Name }}-ssl-ca",
-				resource:  "perconapgclusters.pg.percona.com",
-				dataNames: []string{"ca.crt"},
-			},
-			sslSecret{
-				secret:    "{{ .Name }}-ssl-keypair",
-				resource:  "perconapgclusters.pg.percona.com",
-				dataNames: []string{"tls.crt"},
-			},
-			sslSecret{
-				secret:    "{{ .Name }}-replication-ssl-keypair",
-				resource:  "perconapgclusters.pg.percona.com",
-				dataNames: []string{"tls.crt"},
-			},
-			sslSecret{
-				secret:    "pgo.tls",
-				resource:  "perconapgclusters.pg.percona.com",
-				dataNames: []string{"tls.crt"},
-			},
-		)
+		// resources = append(resources,
+		// 	"perconapgclusters.pg.percona.com",
+		// 	"pgclusters.pg.percona.com",
+		// 	"pgpolicies.pg.percona.com",
+		// 	"pgreplicas.pg.percona.com",
+		// 	"pgtasks.pg.percona.com",
+		// )
+
+		// sslSecrets = append(sslSecrets,
+		// 	sslSecret{
+		// 		secret:    "{{ .Name }}-ssl-ca",
+		// 		resource:  "perconapgclusters.pg.percona.com",
+		// 		dataNames: []string{"ca.crt"},
+		// 	},
+		// 	sslSecret{
+		// 		secret:    "{{ .Name }}-ssl-keypair",
+		// 		resource:  "perconapgclusters.pg.percona.com",
+		// 		dataNames: []string{"tls.crt"},
+		// 	},
+		// 	sslSecret{
+		// 		secret:    "{{ .Name }}-replication-ssl-keypair",
+		// 		resource:  "perconapgclusters.pg.percona.com",
+		// 		dataNames: []string{"tls.crt"},
+		// 	},
+		// 	sslSecret{
+		// 		secret:    "pgo.tls",
+		// 		resource:  "perconapgclusters.pg.percona.com",
+		// 		dataNames: []string{"tls.crt"},
+		// 	},
+		// )
 	case "pgv2":
-		sslSecrets = append(sslSecrets,
+		d.resourcesMap = append(d.resourcesMap, []schema.GroupVersionResource{
+			{
+				Group:    "pgv2.percona.com",
+				Version:  "v2",
+				Resource: "perconapgbackups",
+			},
+			{
+				Group:    "pgv2.percona.com",
+				Version:  "v2",
+				Resource: "perconapgclusters",
+			},
+			{
+				Group:    "pgv2.percona.com",
+				Version:  "v2",
+				Resource: "perconapgrestores",
+			},
+		}...)
+
+		gvr, err := d.findGVRForShortName("pg")
+		if err != nil {
+			log.Fatalf("error getting gvr from short name: %v", err)
+		}
+		d.sslSecrets = append(d.sslSecrets,
 			sslSecret{
-				secret:    "{{ .Name }}-cluster-cert",
-				resource:  "pg",
-				dataNames: []string{"ca.crt", "tls.crt"},
+				secretTemplate: "{{ .Name }}-cluster-cert",
+				secretGVR:      gvr,
+				secretDataName: []string{"ca.crt", "tls.crt"},
 			},
 			sslSecret{
-				secret:    "pgo-root-cacert",
-				resource:  "pg",
-				dataNames: []string{"root.crt"},
-			},
-		)
+				secretTemplate: "pgo-root-cacert",
+				secretGVR:      gvr,
+				secretDataName: []string{"root.crt"},
+			})
+
 	case "pxc":
-		filePaths = append(filePaths,
+		d.resourcesMap = append(d.resourcesMap, []schema.GroupVersionResource{
+			{
+				Group:    "pxc.percona.com",
+				Version:  "v1",
+				Resource: "perconaxtradbclusterbackups",
+			},
+			{
+				Group:    "pxc.percona.com",
+				Version:  "v1",
+				Resource: "perconaxtradbclusterrestores",
+			},
+			{
+				Group:    "pxc.percona.com",
+				Version:  "v1",
+				Resource: "perconaxtradbclusters",
+			},
+		}...)
+
+		filepaths := []string{
 			"var/lib/mysql/mysqld-error.log",
 			"var/lib/mysql/innobackup.backup.log",
 			"var/lib/mysql/innobackup.move.log",
@@ -234,88 +285,127 @@ func New(location, namespace, resource string, kubeconfig string, forwardport st
 			"var/lib/mysql/gvwstate.dat",
 			"var/lib/mysql/mysqld.post.processing.log",
 			"var/lib/mysql/auto.cnf",
-		)
-		d.fileContainer = "logs"
-		sslSecrets = append(sslSecrets,
+		}
+
+		d.individualFiles = append(d.individualFiles, individualFile{
+			containerName: "logs",
+			filepaths:     filepaths,
+		})
+
+		gvr, err := d.findGVRForShortName("pxc")
+		if err != nil {
+			log.Fatalf("error getting gvr from short name: %v", err)
+		}
+		d.sslSecrets = append(d.sslSecrets,
 			sslSecret{
-				secret:    "{{ .Name }}-ssl",
-				resource:  "pxc",
-				dataNames: []string{"ca.crt", "tls.crt"},
+				secretTemplate: "{{ .Name }}-ssl",
+				secretGVR:      gvr,
+				secretDataName: []string{"ca.crt", "tls.crt"},
 			},
 			sslSecret{
-				secret:    "{{ .Name }}-ssl-internal",
-				resource:  "pxc",
-				dataNames: []string{"ca.crt", "tls.crt"},
+				secretTemplate: "{{ .Name }}-ssl-internal",
+				secretGVR:      gvr,
+				secretDataName: []string{"ca.crt", "tls.crt"},
 			},
 			sslSecret{
-				secret:    "{{ .Name }}-ca-cert",
-				resource:  "pxc",
-				dataNames: []string{"ca.crt", "tls.crt"},
-			},
-		)
+				secretTemplate: "{{ .Name }}-ca-cert",
+				secretGVR:      gvr,
+				secretDataName: []string{"ca.crt", "tls.crt"},
+			})
+
 	case "ps":
-		sslSecrets = append(sslSecrets,
+		d.resourcesMap = append(d.resourcesMap, []schema.GroupVersionResource{
+			{
+				Group:    "ps.percona.com",
+				Version:  "v1",
+				Resource: "perconaservermysqlbackups",
+			},
+			{
+				Group:    "ps.percona.com",
+				Version:  "v1",
+				Resource: "perconaservermysqlrestores",
+			},
+			{
+				Group:    "ps.percona.com",
+				Version:  "v1",
+				Resource: "perconaservermysqls",
+			},
+		}...)
+
+		gvr, err := d.findGVRForShortName("ps")
+		if err != nil {
+			log.Fatalf("error getting gvr from short name: %v", err)
+		}
+		d.sslSecrets = append(d.sslSecrets,
 			sslSecret{
-				secret:    "{{ .Name }}-ssl",
-				resource:  "ps",
-				dataNames: []string{"ca.crt", "tls.crt"},
+				secretTemplate: "{{ .Name }}-ssl",
+				secretGVR:      gvr,
+				secretDataName: []string{"ca.crt", "tls.crt"},
 			},
 			sslSecret{
-				secret:    "{{ .Name }}-ca-cert",
-				resource:  "ps",
-				dataNames: []string{"ca.crt", "tls.crt"},
-			},
-		)
+				secretTemplate: "{{ .Name }}-ca-cert",
+				secretGVR:      gvr,
+				secretDataName: []string{"ca.crt", "tls.crt"},
+			})
 	case "psmdb":
-		sslSecrets = append(sslSecrets,
+		d.resourcesMap = append(d.resourcesMap, []schema.GroupVersionResource{
+			{
+				Group:    "psmdb.percona.com",
+				Version:  "v1",
+				Resource: "perconaservermongodbbackups",
+			},
+			{
+				Group:    "psmdb.percona.com",
+				Version:  "v1",
+				Resource: "perconaservermongodbrestores",
+			},
+			{
+				Group:    "psmdb.percona.com",
+				Version:  "v1",
+				Resource: "perconaservermongodbs",
+			},
+		}...)
+		gvr, err := d.findGVRForShortName("psmdb")
+		if err != nil {
+			log.Fatalf("error getting gvr from short name: %v", err)
+		}
+		d.sslSecrets = append(d.sslSecrets,
 			sslSecret{
-				secret:    "{{ .Name }}-ssl",
-				resource:  "psmdb",
-				dataNames: []string{"ca.crt", "tls.crt"},
+				secretTemplate: "{{ .Name }}-ssl",
+				secretGVR:      gvr,
+				secretDataName: []string{"ca.crt", "tls.crt"},
 			},
 			sslSecret{
-				secret:    "{{ .Name }}-ssl-internal",
-				resource:  "psmdb",
-				dataNames: []string{"ca.crt", "tls.crt"},
+				secretTemplate: "{{ .Name }}-ssl-internal",
+				secretGVR:      gvr,
+				secretDataName: []string{"ca.crt", "tls.crt"},
 			},
 			sslSecret{
-				secret:    "{{ .Name }}-ca-cert",
-				resource:  "psmdb",
-				dataNames: []string{"ca.crt", "tls.crt"},
-			},
-		)
+				secretTemplate: "{{ .Name }}-ca-cert",
+				secretGVR:      gvr,
+				secretDataName: []string{"ca.crt", "tls.crt"},
+			})
 	}
-	d.resources = resources
-	d.sslSecrets = sslSecrets
-	d.crType = resource
-	d.filePaths = filePaths
 	return d, nil
-}
-
-type k8sPods struct {
-	Items []corev1.Pod `json:"items"`
-}
-
-type namespaces struct {
-	Items []corev1.Namespace `json:"items"`
 }
 
 // DumpCluster create dump of a cluster in Dumper.location
 func (d *Dumper) DumpCluster() error {
 	file, err := os.Create(d.location + ".tar.gz")
 	if err != nil {
-		return errors.Wrap(err, "create tar file")
+		return fmt.Errorf("create tar file: %w", err)
 	}
 
 	zr := gzip.NewWriter(file)
 	tw := tar.NewWriter(zr)
+	d.tw = tw
 	defer func() {
-		err = addToArchive(d.location+"/errors.txt", d.mode, []byte(d.errors), tw)
+		err = d.writeDataToDump([]byte(d.errors), d.location+"/errors.txt")
 		if err != nil {
 			log.Println("Error: add errors.txt to archive:", err)
 		}
 
-		err = tw.Close()
+		err = d.tw.Close()
 		if err != nil {
 			log.Println("close tar writer", err)
 			return
@@ -332,63 +422,39 @@ func (d *Dumper) DumpCluster() error {
 		}
 	}()
 
-	var nss namespaces
-
+	nss := &corev1.NamespaceList{}
 	if len(d.namespace) > 0 {
 		ns := corev1.Namespace{}
 		ns.Name = d.namespace
 		nss.Items = append(nss.Items, ns)
 	} else {
-		args := []string{"get", "namespaces", "-o", "json"}
-		output, err := d.runCmd(args...)
+		nss, err = d.getNamespacesList()
 		if err != nil {
-			d.logError(err.Error(), args...)
-			return errors.Wrap(err, "get namespaces")
-		}
-
-		err = json.Unmarshal(output, &nss)
-		if err != nil {
-			d.logError(err.Error(), "unmarshal namespaces")
-			return errors.Wrap(err, "unmarshal namespaces")
+			return fmt.Errorf("failed to get namespaces: %w", err)
 		}
 	}
 
 	for _, ns := range nss.Items {
-		args := []string{"get", "pods", "-o", "json", "--namespace", ns.Name}
-		output, err := d.runCmd(args...)
+		podList, err := d.getPodList(ns.Name)
 		if err != nil {
-			d.logError(err.Error(), args...)
+			d.logError(fmt.Errorf("error getting pods from \"%s\" namespace: %w", ns.Name, err))
 			continue
 		}
-
-		var pods k8sPods
-		err = json.Unmarshal(output, &pods)
-		if err != nil {
-			d.logError(err.Error(), "unmarshal pods from namespace", ns.Name)
-			log.Printf("Error: unmarshal pods in namespace %s: %v", ns.Name, err)
-		}
-
-		for _, pod := range pods.Items {
-			location := filepath.Join(d.location, ns.Name, pod.Name, "logs.txt")
-			args := []string{"logs", pod.Name, "--namespace", ns.Name, "--all-containers"}
-			output, err = d.runCmd(args...)
+		for _, pod := range podList.Items {
+			err := d.writeSecretsOfPod(pod)
 			if err != nil {
-				d.logError(err.Error(), args...)
-				err = addToArchive(location, d.mode, []byte(err.Error()), tw)
-				if err != nil {
-					log.Printf("Error: create archive with logs for pod %s in namespace %s: %v", pod.Name, ns.Name, err)
-				}
-				continue
+				d.logError(fmt.Errorf("error getting secrets from \"%s\" namespace: %w", ns.Name, err))
 			}
-			err = addToArchive(location, d.mode, output, tw)
+
+			err = d.writeLogsFromPod(pod)
 			if err != nil {
-				d.logError(err.Error(), "create archive for pod "+pod.Name)
-				log.Printf("Error: create archive for pod %s: %v", pod.Name, err)
+				d.logError(fmt.Errorf("error while writing logs from pods and \"%s\" namespace to dump: %w", ns.Name, err))
 			}
+
 			if len(pod.Labels) == 0 {
 				continue
 			}
-			location = filepath.Join(d.location, ns.Name, pod.Name, "/summary.txt")
+
 			component := resourceType(d.crType)
 			if component == "psmdb" {
 				component = "mongod"
@@ -396,234 +462,232 @@ func (d *Dumper) DumpCluster() error {
 			if component == "ps" {
 				component = "mysql"
 			}
-			if pod.Labels["app.kubernetes.io/instance"] != "" && pod.Labels["app.kubernetes.io/component"] != "" {
-				resource := "secret/" + pod.Labels["app.kubernetes.io/instance"] + "-" + pod.Labels["app.kubernetes.io/component"]
-				err = d.getResource(resource, ns.Name, true, tw)
-				if err != nil {
-					log.Printf("Error: get %s resource: %v", resource, err)
-				}
-			}
 			if pod.Labels["app.kubernetes.io/component"] == component ||
+				pod.Labels["app.kubernetes.io/name"] == component ||
 				(component == "pg" && pod.Labels["pgo-pg-database"] == "true") ||
 				(component == "pgv2" && pod.Labels["pgv2.percona.com/version"] != "" && pod.Labels["postgres-operator.crunchydata.com/instance"] != "") {
-				var crName string
-				if component == "pg" {
-					crName = pod.Labels["pg-cluster"]
-				} else if component == "pgv2" {
-					crName = pod.Labels["postgres-operator.crunchydata.com/cluster"]
-				} else {
-					crName = pod.Labels["app.kubernetes.io/instance"]
-				}
-				// Get summary
+
+				location := filepath.Join(d.location, ns.Name, pod.Name, "/summary.txt")
+				//Get summary
 				if !d.skipPodSummary {
-					output, err = d.getPodSummary(resourceType(d.crType), pod.Name, crName, ns.Name)
+					output, err := d.getPodSummary(pod)
 					if err != nil {
-						d.logError(err.Error(), d.crType, pod.Name)
-						err = addToArchive(location, d.mode, []byte(err.Error()), tw)
+						d.logError(fmt.Errorf("error while creating summary for \"%s\" pod and \"%s\" namespace: %w", pod.Name, ns.Name, err))
+						err = d.writeDataToDump([]byte(err.Error()), location)
 						if err != nil {
 							log.Printf("Error: create summary errors archive for pod %s in namespace %s: %v", pod.Name, ns.Name, err)
 						}
 					} else {
-						err = addToArchive(location, d.mode, output, tw)
+						log.Printf("Created summary for pod/namespace \"%s\"/\"%s\", Writing to dump", pod.Name, pod.Namespace)
+						err = d.writeDataToDump(output, location)
 						if err != nil {
-							d.logError(err.Error(), "create summary archive for pod "+pod.Name)
-							log.Printf("Error: create summary  archive for pod %s: %v", pod.Name, err)
+							d.logError(fmt.Errorf("error while writing summary for \"%s\" pod and \"%s\" namespace to dump: %w", pod.Name, ns.Name, err))
 						}
 					}
 				}
 
-				// get individual Logs
+				// get individual files(Logs)
 				location = filepath.Join(d.location, ns.Name, pod.Name)
-				for _, path := range d.filePaths {
-					err = d.getIndividualFiles(ns.Name, pod.Name, path, location, tw)
-					if err != nil {
-						d.logError(err.Error(), "get file "+path+" for pod "+pod.Name)
-						log.Printf("Error: get %s file: %v", path, err)
+				for _, indf := range d.individualFiles {
+					for _, path := range indf.filepaths {
+						file, err := d.getIndividualFilesFromPod(pod, path, indf.containerName)
+						if err != nil {
+							d.logError(fmt.Errorf("error while getting individual files for \"%s\" pod and \"%s\" namespace to dump: %w", pod.Name, ns.Name, err))
+							continue
+						}
+
+						if len(file) != 0 {
+							log.Printf("Writing individual file with path %s to dump", path)
+							err := d.writeDataToDump(file, location+"/"+path)
+							if err != nil {
+								d.logError(fmt.Errorf("error while writing individula files for \"%s\" pod and \"%s\" namespace to dump: %w", pod.Name, ns.Name, err))
+							}
+						}
 					}
 				}
+
 			}
 		}
-
-		for _, resource := range d.resources {
-			err = d.getResource(resource, ns.Name, false, tw)
+		for _, gvr := range d.resourcesMap {
+			data, err := d.getResource(gvr)
 			if err != nil {
-				log.Printf("Error: get %s resource: %v", resource, err)
+				d.logError(fmt.Errorf("error while getting resource \"%s\" in \"%s\" namespace: %w", gvr.Resource, ns.Name, err))
+				continue
+			}
+			err = d.writeDataToDump(data, filepath.Join(d.location, ns.Name, gvr.Resource+".yaml"))
+			if err != nil {
+				d.logError(fmt.Errorf("error while dumping resource \"%s\" in \"%s\" namespace: %w", gvr.Resource, ns.Name, err))
 			}
 		}
-
-		for _, s := range d.sslSecrets {
-			err = d.getSSLCertificates(s, ns.Name, tw)
+		for _, ssl := range d.sslSecrets {
+			err = d.dumpSSLDataFromSecrets(ns.Name, ssl)
 			if err != nil {
-				log.Printf("Error: get SSL certificates in %s: %v", s.secret, err)
+				d.logError(fmt.Errorf("error while dumping ssl data in \"%s\" namespace: %w", ns.Name, err))
 			}
 		}
 	}
 
-	err = d.getResource("nodes", "", false, tw)
+	err = d.writeNodes()
 	if err != nil {
-		return errors.Wrapf(err, "get nodes")
+		d.logError(fmt.Errorf("error while dumping nodes: %w", err))
 	}
 
 	return nil
 }
 
-// runCmd run command (Dumper.cmd) with given args, return it output
-func (d *Dumper) runCmd(args ...string) ([]byte, error) {
-	var outb, errb bytes.Buffer
-	args = append(args, "--kubeconfig", d.kubeconfig)
-	cmd := exec.Command(d.cmd, args...)
-	cmd.Stdout = &outb
-	cmd.Stderr = &errb
-	err := cmd.Run()
-	if err != nil || errb.Len() > 0 {
-		return nil, errors.Errorf("error: %v, stderr: %s, stdout: %s", err, errb.String(), outb.String())
+func (d *Dumper) writeLogsFromPod(pod corev1.Pod) error {
+	logs, err := d.getLogs(pod)
+	if err != nil {
+		return fmt.Errorf("error while getting logs from pod \"%s\" in namespace \"%s\": %w", pod.Name, pod.Namespace, err)
 	}
-
-	return outb.Bytes(), nil
+	location := filepath.Join(d.location, pod.Namespace, pod.Name, "logs.txt")
+	log.Printf("Found logs in pod \"%s\" in namespace \"%s\". Writing to the dump\n", pod.Name, pod.Namespace)
+	err = d.writeDataToDump([]byte(logs), location)
+	if err != nil {
+		return fmt.Errorf("error while adding logs from pod \"%s\" in namespace \"%s\" to dump: %w", pod.Name, pod.Namespace, err)
+	}
+	return nil
 }
 
-func (d *Dumper) getResource(name, namespace string, ignoreNotFound bool, tw *tar.Writer) error {
-	location := d.location
-	args := []string{"get", name, "-o", "yaml"}
-	if ignoreNotFound {
-		args = append(args, "--ignore-not-found")
-	}
-	if len(namespace) > 0 {
-		args = append(args, "--namespace", namespace)
-		location = filepath.Join(d.location, namespace)
-	}
-	location = filepath.Join(location, name+".yaml")
-	output, err := d.runCmd(args...)
+func (d *Dumper) writeSecretsOfPod(pod corev1.Pod) error {
+	location := filepath.Join(d.location, pod.Namespace)
+	secretList, err := d.getSecretsOfPod(pod)
 	if err != nil {
-		d.logError(err.Error(), args...)
-		log.Printf("Error: get resource %s in namespace %s: %v", name, namespace, err)
-		return addToArchive(location, d.mode, []byte(err.Error()), tw)
+		return fmt.Errorf("failed to get secrets from namespace: %w", err)
 	}
-
-	if ignoreNotFound && len(output) == 0 {
-		return nil
-	}
-
-	if strings.Contains(name, "secret") && strings.Contains(name, "pgbouncer") {
-		output, err = removePgbouncerSecretData(output)
+	for _, secret := range secretList.Items {
+		secretName := secret.GetName()
+		itemMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&secret)
 		if err != nil {
-			d.logError(err.Error(), args...)
-			log.Printf("Error: remove secret data from resource %s in namespace %s: %v", name, namespace, err)
-			return addToArchive(location, d.mode, []byte(err.Error()), tw)
+			return fmt.Errorf("error converting secret %s to map: %w", secretName, err)
 		}
 
-	}
+		// pt-k8s-debug-collector should not collect secret data of pgbouncer
+		if strings.Contains(secretName, "pgbouncer") {
+			log.Printf("Cleaning secret data from \"%s\" in namespace \"%s\".\n", secret.GetName(), pod.Namespace)
+			itemMap["data"] = map[string]interface{}{
+				"warning": "pt-k8s-debug-collector is not collecting secret details of pgbouncer",
+			}
+		}
 
-	return addToArchive(location, d.mode, output, tw)
+		yamlBytes, err := yaml.Marshal(itemMap)
+		if err != nil {
+			return fmt.Errorf("failed to marshal object to YAML: %w", err)
+		}
+
+		log.Printf("Found secret with name/namespace \"%s\"/\"%s\". Writing to dump.\n", secretName, pod.Namespace)
+		err = d.writeDataToDump(yamlBytes, filepath.Join(location, "secret/"+secretName+".yaml"))
+		if err != nil {
+			return fmt.Errorf("failed to write secret to dump: %w", err)
+		}
+	}
+	return nil
 }
 
-func removePgbouncerSecretData(input []byte) ([]byte, error) {
-	str := string(input)
-	startIndex := strings.Index(str, "\ndata:\n")
-	if startIndex == -1 {
-		return nil, errors.New("failed to find start index of pgbouncer secret data")
+func (d *Dumper) writeNodes() error {
+	nodeList, err := d.getNodeList()
+	if err != nil {
+		return fmt.Errorf("error while getting nodes: %w", err)
 	}
-	endIndex := strings.Index(str, "\nkind")
-	if endIndex == -1 {
-		return nil, errors.New("failed to find end index of pgbouncer secret data")
+	var buf bytes.Buffer
+	for _, node := range nodeList.Items {
+		node.ManagedFields = nil
+		yamlBytes, err := yaml.Marshal(node)
+		if err != nil {
+			return fmt.Errorf("failed to marshal object to YAML: %w", err)
+		}
+		_, err = buf.Write(yamlBytes)
+		if err != nil {
+			return fmt.Errorf("failed to add data to buffer: %w", err)
+		}
 	}
-	str = str[:startIndex] +
-		"\ndata:\n warning: pt-k8s-debug-collector is not collecting secret details of pgbouncer" + str[endIndex:]
-	return []byte(str), nil
-}
-
-func (d *Dumper) logError(err string, args ...string) {
-	d.errors += d.cmd + " " + strings.Join(args, " ") + "\n" + err + "\n\n"
-}
-
-func addToArchive(location string, mode int64, content []byte, tw *tar.Writer) error {
-	hdr := &tar.Header{
-		Name:    location,
-		Mode:    mode,
-		ModTime: time.Now(),
-		Size:    int64(len(content)),
-	}
-	if err := tw.WriteHeader(hdr); err != nil {
-		return errors.Wrapf(err, "write header to %s", location)
-	}
-	if _, err := tw.Write(content); err != nil {
-		return errors.Wrapf(err, "write content to %s", location)
+	log.Print("Found nodes. Writing to the dump\n")
+	location := filepath.Join(d.location, "nodes.yaml")
+	err = d.writeDataToDump(buf.Bytes(), location)
+	if err != nil {
+		return fmt.Errorf("error while adding nodes to dump: %w", err)
 	}
 
 	return nil
 }
 
-type crSecrets struct {
-	Spec struct {
-		SecretName string `json:"secretsName,omitempty"`
-		Secrets    struct {
-			Users string `json:"users,omitempty"`
-		} `json:"secrets,omitempty"`
-		Users []struct {
-			Name       string `json:"name,omitempty"`
-			SecretName string `json:"secretName,omitempty"`
-		} `json:"users,omitempty"`
-	} `json:"spec"`
-}
-
-func (d *Dumper) getIndividualFiles(namespace string, podName, path, location string, tw *tar.Writer) error {
-	if len(d.fileContainer) == 0 {
-		return errors.Errorf("Logs container name is not specified for resource %s in namespace %s", resourceType(d.crType), d.namespace)
+func (d *Dumper) getIndividualFilesFromPod(pod corev1.Pod, filepath, containerName string) ([]byte, error) {
+	if len(filepath) == 0 || len(containerName) == 0 {
+		return nil, errors.New("container name or filepath is not specified")
 	}
-	args := []string{"-n", namespace, "-c", d.fileContainer, "cp", podName + ":" + path, "/dev/stdout"}
-	output, err := d.runCmd(args...)
+
+	cmd := []string{"tar", "cf", "-", filepath}
+	stdout, stderr, err := d.executeInPod(nil, cmd, pod, containerName)
 	if err != nil {
-		d.logError(err.Error(), args...)
-		log.Printf("Error: get path %s for resource %s in namespace %s: %v", path, resourceType(d.crType), d.namespace, err)
-		return addToArchive(location, d.mode, []byte(err.Error()), tw)
+		return nil, fmt.Errorf("failed to execute command in Pod: stderr: %s: %w", &stderr, err)
 	}
 
-	if len(output) == 0 {
-		return nil
+	tarReader := tar.NewReader(&stdout)
+	var fileContentBuffer bytes.Buffer
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("error reading tar header: %w", err)
+		}
+
+		if header.Typeflag == tar.TypeReg && header.Name == filepath {
+			_, copyErr := io.Copy(&fileContentBuffer, tarReader)
+			if copyErr != nil {
+				return nil, fmt.Errorf("error copying file content: %w", copyErr)
+			}
+		}
 	}
-	return addToArchive(location+"/"+path, d.mode, output, tw)
+
+	return fileContentBuffer.Bytes(), nil
 }
 
-func (d *Dumper) getPodSummary(resource, podName, crName string, namespace string) ([]byte, error) {
+func (d *Dumper) getPodSummary(pod corev1.Pod) ([]byte, error) {
 	var (
 		summCmdName string
 		ports       string
 		summCmdArgs []string
 	)
 
-	switch resource {
-	case "ps":
-		fallthrough
-	case "pxc":
-		var pass, port string
+	switch resourceType(d.crType) {
+	case "pxc", "ps":
+		var port string
 		if d.forwardport != "" {
 			port = d.forwardport
 		} else {
 			port = "3306"
 		}
-		cr, err := d.getCR(resource+"/"+crName, namespace)
+
+		pass, err := d.getSecretValueFromPod(pod, "root")
 		if err != nil {
-			return nil, errors.Wrap(err, "get cr")
+			return nil, fmt.Errorf("failed to get password from pxc/ps users secret: %w", err)
 		}
-		if cr.Spec.SecretName != "" {
-			pass, err = d.getDataFromSecret(cr.Spec.SecretName, "root", namespace)
-		} else {
-			pass, err = d.getDataFromSecret(crName+"-secrets", "root", namespace)
-		}
-		if err != nil {
-			return nil, errors.Wrap(err, "get password from pxc users secret")
-		}
+
 		ports = port + ":3306"
 		summCmdName = "pt-mysql-summary"
-		summCmdArgs = []string{"--host=127.0.0.1", "--port=" + port, "--user=root", "--password=" + string(pass)}
-	case "pg", "pgv2":
-		var kubeconfig string
-		if d.kubeconfig != "" {
-			kubeconfig = " --kubeconfig=" + d.kubeconfig
+		summCmdArgs = []string{"--host=127.0.0.1", "--port=" + port, "--user=root", "--password=" + pass}
+
+	case "pgv2":
+		scriptURL := "https://raw.githubusercontent.com/percona/support-snippets/master/postgresql/pg_gather/gather.sql"
+		resp, err := http.Get(scriptURL)
+		if err != nil {
+			return nil, fmt.Errorf("error fetching SQL script: %w", err)
 		}
-		summCmdName = "sh"
-		summCmdArgs = []string{"-c", "curl https://raw.githubusercontent.com/percona/support-snippets/master/postgresql/pg_gather/gather.sql 2>/dev/null | " +
-			d.cmd + kubeconfig + " -n " + namespace + " exec -i " + podName + " -- psql -X -f - "}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("failed to fetch SQL script, status code: %d", resp.StatusCode)
+		}
+		command := []string{"psql", "-X", "-f", "-"}
+
+		outb, errb, err := d.executeInPod(resp.Body, command, pod, "database")
+		if err != nil {
+			return nil, fmt.Errorf("failed to execute command inside pod stdout: %s\n, stderr\n: %s: %w", outb.String(), errb.String(), err)
+		}
+		return outb.Bytes(), nil
+
 	case "psmdb":
 		var port string
 		if d.forwardport != "" {
@@ -631,150 +695,35 @@ func (d *Dumper) getPodSummary(resource, podName, crName string, namespace strin
 		} else {
 			port = "27017"
 		}
-		cr, err := d.getCR("psmdb/"+crName, namespace)
+
+		user, err := d.getSecretValueFromPod(pod, "MONGODB_DATABASE_ADMIN_USER")
 		if err != nil {
-			return nil, errors.Wrap(err, "get cr")
+			return nil, fmt.Errorf("get user name from psmdb users secret: %w", err)
 		}
-		user, err := d.getDataFromSecret(cr.Spec.Secrets.Users, "MONGODB_DATABASE_ADMIN_USER", namespace)
+		pass, err := d.getSecretValueFromPod(pod, "MONGODB_DATABASE_ADMIN_PASSWORD")
 		if err != nil {
-			return nil, errors.Wrap(err, "get user name from psmdb users secret")
+			return nil, fmt.Errorf("get password from psmdb users secret: %w", err)
 		}
-		pass, err := d.getDataFromSecret(cr.Spec.Secrets.Users, "MONGODB_DATABASE_ADMIN_PASSWORD", namespace)
-		if err != nil {
-			return nil, errors.Wrap(err, "get password from psmdb users secret")
-		}
+
 		ports = port + ":27017"
 		summCmdName = "pt-mongodb-summary"
 		summCmdArgs = []string{"--username=" + user, "--password=" + string(pass), "--authenticationDatabase=admin", "127.0.0.1:" + port}
 	}
-
-	cmdPortFwd := exec.Command(d.cmd, "port-forward", "pod/"+podName, ports, "-n", namespace, "--kubeconfig", d.kubeconfig)
-	go func() {
-		err := cmdPortFwd.Run()
-		if err != nil {
-			d.logError(err.Error(), "port-forward")
-		}
-	}()
-	defer func() {
-		err := cmdPortFwd.Process.Kill()
-		if err != nil {
-			d.logError(err.Error(), "kill port-forward")
-		}
-	}()
-
-	time.Sleep(3 * time.Second) // wait for port-forward command
+	stopChan, err := d.portForwardPod(pod, []string{ports})
+	if err != nil {
+		return nil, err
+	}
+	defer close(stopChan)
 
 	var outb, errb bytes.Buffer
 	cmd := exec.Command(summCmdName, summCmdArgs...)
 	cmd.Stdout = &outb
 	cmd.Stderr = &errb
-	err := cmd.Run()
+	err = cmd.Run()
 	if err != nil {
-		return nil, errors.Wrapf(err, "stderr: %s\nstdout: %s", errb.String(), outb.String())
+		return nil, fmt.Errorf("stderr: %s\nstdout: %s \nerr: %w", errb.String(), outb.String(), err)
 	}
 	return outb.Bytes(), nil
-}
-
-func (d *Dumper) getCR(crName string, namespace string) (crSecrets, error) {
-	var cr crSecrets
-	output, err := d.runCmd("get", crName, "-o", "json", "-n", namespace)
-	if err != nil {
-		return cr, errors.Wrap(err, "get "+crName)
-	}
-	err = json.Unmarshal(output, &cr)
-	if err != nil {
-		return cr, errors.Wrap(err, "unmarshal "+crName+" cr")
-	}
-
-	return cr, nil
-}
-
-func (d *Dumper) getDataFromSecret(secretName, dataName string, namespace string) (string, error) {
-	passEncoded, err := d.runCmd("get", "secrets/"+secretName, "--template={{.data."+dataName+"}}", "-n", namespace)
-	if err != nil {
-		return "", errors.Wrap(err, "run get secret cmd")
-	}
-	pass, err := base64.StdEncoding.DecodeString(string(passEncoded))
-	if err != nil {
-		return "", errors.Wrap(err, "decode data")
-	}
-
-	return string(pass), nil
-}
-
-func (d *Dumper) getSSLDataFromSecret(secretName, dataName string, namespace string) (string, error) {
-	data, err := d.runCmd("get", "secrets/"+secretName, "-o", "go-template='{{ index .data \""+dataName+"\"  | base64decode }}'", "-n", namespace)
-	if err != nil {
-		return "", errors.Wrap(err, "run get secret cmd")
-	}
-
-	return string(data), nil
-}
-
-func (d *Dumper) getSSLCertificates(secret sslSecret, namespace string, tw *tar.Writer) error {
-	cr := struct {
-		Items []struct {
-			Metadata struct {
-				Name string `json:"name"`
-			} `json:"metadata"`
-		} `json:"items"`
-	}{}
-
-	output, err := d.runCmd("get", secret.resource, "-o", "json", "-n", namespace)
-	if err != nil {
-		return errors.Wrap(err, "get "+secret.resource)
-	}
-	err = json.Unmarshal(output, &cr)
-	if err != nil {
-		return errors.Wrapf(err, "unmarshal %s cr", secret.resource)
-	}
-
-	if len(cr.Items) > 1 {
-		return errors.Wrap(err, "Unexpected structure for resource "+secret.resource)
-	}
-
-	for _, item := range cr.Items {
-		location := d.location
-
-		if len(namespace) > 0 {
-			location = filepath.Join(d.location, namespace)
-		}
-
-		var nb bytes.Buffer
-		t := template.Must(template.New("secret").Parse(secret.secret))
-		t.Execute(&nb, item.Metadata)
-
-		name := nb.String()
-		location = filepath.Join(location, name)
-
-		result := make([]byte, 0)
-		for _, dn := range secret.dataNames {
-			result = append(result, dn+"\n"...)
-			data, err := d.getSSLDataFromSecret(name, dn, namespace)
-			if err != nil {
-				errors.Wrapf(err, "Error getting certificate %s from secret %s", dn, name)
-			}
-
-			var outb, errb bytes.Buffer
-			cmd := exec.Command("sh", "-c", "echo "+data+" | openssl x509 -noout -text")
-			cmd.Stdout = &outb
-			cmd.Stderr = &errb
-			err = cmd.Run()
-			if err != nil {
-				errors.Wrapf(err, "stderr: %s\nstdout: %s", errb.String(), outb.String())
-			}
-			result = append(result, outb.Bytes()...)
-		}
-
-		err = addToArchive(location, d.mode, result, tw)
-
-		if err != nil {
-			return errors.Wrapf(err, "Cannot add certificates in the secret %s into resulting archive", name)
-		}
-
-	}
-
-	return nil
 }
 
 func resourceType(s string) string {
@@ -792,4 +741,155 @@ func resourceType(s string) string {
 		return "ps"
 	}
 	return s
+}
+
+func (d *Dumper) dumpSSLDataFromSecrets(namespace string, secret sslSecret) error {
+	t, err := template.New("secret").Parse(secret.secretTemplate)
+	if err != nil {
+		return fmt.Errorf("error whlie parse secret template: %w", err)
+	}
+
+	list, err := d.getUnstructuredListWithNamespace(secret.secretGVR, namespace)
+	if err != nil {
+		return fmt.Errorf("error while listening resources for %s in namespace %s: %w", secret.secretGVR.String(), namespace, err)
+	}
+
+	if len(list.Items) == 0 {
+		log.Printf("No resources found for %s in namespace %s", secret.secretGVR.String(), namespace)
+		return nil
+	}
+
+	for _, item := range list.Items {
+		itemName := item.GetName()
+		location := d.location
+		if len(namespace) > 0 {
+			location = filepath.Join(d.location, namespace)
+		}
+
+		var nb bytes.Buffer
+		templateData := struct {
+			Name string
+		}{
+			Name: itemName,
+		}
+
+		if err := t.Execute(&nb, templateData); err != nil {
+			log.Printf("Error executing secret template for item %s: %v. Skipping.", itemName, err)
+			continue
+		}
+		secretName := nb.String()
+		location = filepath.Join(location, secretName)
+
+		result := make([]byte, 0)
+
+		for _, dn := range secret.secretDataName {
+			result = append(result, dn+"\n"...)
+
+			secret, err := d.clientSet.CoreV1().Secrets(namespace).Get(context.TODO(), secretName, metav1.GetOptions{})
+			if err != nil {
+				log.Printf("Error getting secret %s in namespace %s: %v", secretName, namespace, err)
+				result = append(result, []byte(fmt.Sprintf("ERROR: could not get secret: %v\n", err))...)
+				continue
+			}
+
+			dataBytes, ok := secret.Data[dn]
+			if !ok {
+				log.Printf("Data key %s not found in secret %s", dn, secretName)
+				result = append(result, []byte(fmt.Sprintf("ERROR: key %s not found in secret\n", dn))...)
+				continue
+			}
+
+			var outb, errb bytes.Buffer
+			cmd := exec.Command("openssl", "x509", "-noout", "-text")
+			cmd.Stdin = bytes.NewReader(dataBytes)
+			cmd.Stdout = &outb
+			cmd.Stderr = &errb
+			cmd.Env = os.Environ()
+
+			err = cmd.Run()
+			if err != nil {
+				log.Printf("openssl command failed for %s/%s (key %s): %v. Stderr: %s",
+					namespace, secretName, dn, err, errb.String())
+				errMsg := fmt.Sprintf("ERROR running openssl: %v\nStderr: %s\n", err, errb.String())
+				result = append(result, []byte(errMsg)...)
+			} else {
+				result = append(result, outb.Bytes()...)
+				result = append(result, "\n"...)
+			}
+		}
+		log.Printf("Found ssl data %s. Writing to dump.", itemName)
+		err = d.writeDataToDump(result, location)
+		if err != nil {
+			return fmt.Errorf("cannot add certificates from secret %s to archive: %w", secretName, err)
+		}
+	}
+
+	return nil
+}
+
+func (d *Dumper) autoCustomResource() (string, error) {
+	apiGroupList, err := d.clientSet.DiscoveryClient.ServerGroups()
+	if err != nil {
+		return "", fmt.Errorf("error getting server groups: %w", err)
+	}
+	var resourceNames string
+	var beforeSorting []string
+	uniqueResourceNames := make(map[string]bool)
+	for _, group := range apiGroupList.Groups {
+		for _, version := range group.Versions {
+			resourceList, err := d.clientSet.DiscoveryClient.ServerResourcesForGroupVersion(version.GroupVersion)
+			if err != nil {
+				log.Printf("Warning: Could not get resources for GroupVersion %s: %v", version.GroupVersion, err)
+				continue
+			}
+			for _, resource := range resourceList.APIResources {
+				if resource.Name != "" && !strings.Contains(resource.Name, "/") {
+					if group.Name != "" {
+						uniqueResourceNames[resource.Name+"."+group.Name] = true
+					} else {
+						uniqueResourceNames[resource.Name] = true
+					}
+				}
+			}
+		}
+	}
+	for name := range uniqueResourceNames {
+		beforeSorting = append(beforeSorting, name)
+	}
+	slices.Sort(beforeSorting)
+	for _, name := range beforeSorting {
+		resourceNames = resourceNames + name + "\n"
+	}
+
+	matches := resourcesRe.FindAllStringSubmatch(resourceNames, -1)
+	if len(matches) == 0 {
+		return "none", nil
+	}
+	for _, match := range matches {
+		return match[1], nil
+	}
+	return "", nil
+}
+
+func (d *Dumper) logError(err error) {
+	log.Printf("%v", err)
+	d.errors += fmt.Sprintf("%v \n\n", err)
+}
+
+// Writes all data to location in dump
+func (d *Dumper) writeDataToDump(data []byte, location string) error {
+	hdr := &tar.Header{
+		Name:    location,
+		Mode:    d.mode,
+		ModTime: time.Now(),
+		Size:    int64(len(data)),
+	}
+	if err := d.tw.WriteHeader(hdr); err != nil {
+		return fmt.Errorf("failed to write header to %s: %w", location, err)
+	}
+	_, err := d.tw.Write(data)
+	if err != nil {
+		return fmt.Errorf("failed to write data to %s: %w", location, err)
+	}
+	return nil
 }

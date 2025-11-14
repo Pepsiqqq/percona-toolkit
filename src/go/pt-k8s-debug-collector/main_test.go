@@ -57,8 +57,8 @@ const (
 	psmdb_cr     = "../tests/kubeconfigs/psmdb_cr.yaml"
 	pgv2_bundle  = "../tests/kubeconfigs/pg_v2_bundle.yaml"
 	pgv2_cr      = "../tests/kubeconfigs/pg_v2_cr.yaml"
-	pgv1_bundle  = "../tests/kubeconfigs/pg_v1_bundle.yaml"
-	pgv1_cr      = "../tests/kubeconfigs/pg_v1_cr.yaml"
+	//pgv1_bundle  = "../tests/kubeconfigs/pg_v1_bundle.yaml"
+	//pgv1_cr      = "../tests/kubeconfigs/pg_v1_cr.yaml"
 )
 
 func TestMain(m *testing.M) {
@@ -78,7 +78,7 @@ func TestMain(m *testing.M) {
 	exitCode := m.Run()
 	if exitCode == 0 {
 		fmt.Println("Tests finished succesfully, destroying minikube")
-		utils.StopMinikube()
+//		utils.StopMinikube()
 	}
 	os.Exit(exitCode)
 }

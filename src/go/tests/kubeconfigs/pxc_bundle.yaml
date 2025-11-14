@@ -11797,7 +11797,7 @@ spec:
         - name: OPERATOR_NAME
           value: percona-xtradb-cluster-operator
         - name: DISABLE_TELEMETRY
-          value: "false"
+          value: "true"
         image: percona/percona-xtradb-cluster-operator:1.18.0
         imagePullPolicy: Always
         livenessProbe:
