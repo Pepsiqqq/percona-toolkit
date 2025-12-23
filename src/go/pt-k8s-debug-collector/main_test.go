@@ -2,7 +2,7 @@ package main
 
 import (
 	"bytes"
-	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path"
@@ -36,53 +36,41 @@ We do not explicitly test --kubeconfig and --forwardport options, because they a
 
 /*
 Tests TODO:
-
 - Test clusters with custom user and secrets. With the way we currently test,
   we just need to create a cluster with particular options. But it is already
   time and resource consuming operation. So we need to either test only getCR
   function or create a mock cluster, or find a better way to deploy test clusters.
 */
 
-/*
-Tests collection of the individual files by pt-k8s-debug-collector.
-Requires running K8SPXC instance and kubectl, configured to access that instance by default.
-*/
-
-const (
-	pxc_bundle   = "../tests/kubeconfigs/pxc_bundle.yaml"
-	pxc_cr       = "../tests/kubeconfigs/pxc_cr.yaml"
-	ps_bundle    = "../tests/kubeconfigs/ps_bundle.yaml"
-	ps_cr        = "../tests/kubeconfigs/ps_cr.yaml"
-	psmdb_bundle = "../tests/kubeconfigs/psmdb_bundle.yaml"
-	psmdb_cr     = "../tests/kubeconfigs/psmdb_cr.yaml"
-	pgv2_bundle  = "../tests/kubeconfigs/pg_v2_bundle.yaml"
-	pgv2_cr      = "../tests/kubeconfigs/pg_v2_cr.yaml"
-	//pgv1_bundle  = "../tests/kubeconfigs/pg_v1_bundle.yaml"
-	//pgv1_cr      = "../tests/kubeconfigs/pg_v1_cr.yaml"
-)
+// You need to have anydbver in path to start tests (https://github.com/ihanick/anydbver)
 
 func TestMain(m *testing.M) {
-	setupConfigs := make(map[string]string) // key = path to operator yaml | value = path to cluster yaml
-	setupConfigs[pxc_bundle] = pxc_cr
-	setupConfigs[ps_bundle] = ps_cr
-	setupConfigs[psmdb_bundle] = psmdb_cr
-	setupConfigs[pgv2_bundle] = pgv2_cr
-	//setupConfigs[pgv1_bundle] = pgv1_cr
+	//args := []string{"deploy", "k8s-pg:2.8.0", "k8s-pxc:1.18.0","k8s-psmdb:1.21.1", "k8s-ps:1.0.0", }
 
-	err := utils.SetupK8sConcurrent(setupConfigs)
-	if err != nil {
-		fmt.Printf("error when setuping k8s: %v", err)
-		os.Exit(1)
-	}
+	// For some reason ps is not reporting correctly that it is ready,
+	// you can deploy it manually using above command but it will hang until timeout
+	// even if it's deployed and ready
+
+	// TODO: fix ps and add pgv1
+	args := []string{"deploy", "k8s-pg:2.8.0", "k8s-pxc:1.18.0", "k8s-psmdb:1.21.1"}
+	utils.DeployAnyDbVer(args)
 
 	exitCode := m.Run()
 	if exitCode == 0 {
-		fmt.Println("Tests finished succesfully, destroying minikube")
-//		utils.StopMinikube()
+		log.Println("Tests finished succesfully, destroying deployments")
+		// Comment this if you don't want to destroy deployments after tests
+		err := utils.CleanUpAnyDbVer()
+		if err != nil {
+			log.Fatalf("there was an error when destroying deloyments: %v", err)
+		}
 	}
 	os.Exit(exitCode)
 }
 
+/*
+Tests collection of the individual files by pt-k8s-debug-collector.
+Requires running K8SPXC instance and kubectl, configured to access that instance by default.
+*/
 func TestIndividualFiles(t *testing.T) {
 	config, err := utils.GetKubeConfigString()
 	if err != nil {
